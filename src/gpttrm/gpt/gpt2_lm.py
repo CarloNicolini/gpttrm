@@ -7,8 +7,8 @@ from transformers import GPT2LMHeadModel, AutoModel
 import lightning.pytorch as pl
 
 from .dataloader import text_dataset
-from .utils import top_k_top_p_filtering, load_weights_lm_head
 from .gpt2_tokenizer import GPT2TextEncoder
+from ..utils import top_k_top_p_filtering, load_weights_lm_head
 
 
 class GPT2LanguageModel(pl.LightningModule):

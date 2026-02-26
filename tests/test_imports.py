@@ -3,8 +3,8 @@ import argparse
 import lightning.pytorch as pl
 import torch
 
-from gpttrm.gpt2_lm import GPT2LanguageModel
-from gpttrm.gpt2_tokenizer import GPT2TextEncoder
+from gpttrm.gpt.gpt2_lm import GPT2LanguageModel
+from gpttrm.gpt.gpt2_tokenizer import GPT2TextEncoder
 
 
 def test_imports():
