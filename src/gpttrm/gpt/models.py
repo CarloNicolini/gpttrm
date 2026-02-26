@@ -354,7 +354,7 @@ class GPT2TRMBase(pl.LightningModule):
             # Iterate over all intermediate reasoning outputs
             for h, inter_logits in enumerate(deep_sup_logits):
                 # 1. Deep Supervision (Cross Entropy towards correct token)
-                # (We don't add the final logits here as they are already `loss`)
+                # We iteratively add all intermediate unrolled states
                 if h < len(deep_sup_logits) - 1:
                     ds_loss += self.compute_loss(inter_logits, tokens)
 
@@ -374,7 +374,12 @@ class GPT2TRMBase(pl.LightningModule):
 
             # Average and combine
             num_cycles = len(deep_sup_logits)
-            loss = loss + (ds_loss / max(1, num_cycles - 1))
+
+            # The previous code summed `loss + Average(Intermediates)`.
+            # If standard init loss is ~10, this results in `10 + 10 = 20`.
+            # We want to mathematically AVERAGE all steps:
+            # `(Final_Loss + Sum_Intermediates) / num_cycles`
+            loss = (loss + ds_loss) / max(1, num_cycles)
 
             if halting_logits is not None:
                 bce_avg = bce_loss / num_cycles
