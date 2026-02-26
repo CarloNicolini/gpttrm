@@ -3,7 +3,6 @@ from typing import Any, Tuple, Dict, Sequence, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-import math
 
 IGNORE_LABEL_ID = -100
 

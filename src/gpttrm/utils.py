@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -69,12 +71,6 @@ def load_weights_lm_head(model, original_model):
                     new_state_dict[k][:min_size, :] = v[:min_size, :]
 
     model.load_state_dict(new_state_dict, strict=False)
-
-
-import math
-
-import torch
-from torch import nn
 
 
 def trunc_normal_init_(
