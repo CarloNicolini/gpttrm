@@ -173,6 +173,17 @@ The original TRM was designed for fixed-size reasoning tasks (Sudoku, mazes, ARC
 - **No puzzle embeddings**: Removed sparse puzzle embeddings; positional information is already baked into GPT-2's hidden states.
 - **Bidirectional attention**: The TRM's internal attention is non-causal, since it refines a complete hidden state rather than generating tokens autoregressively. Causal masking is handled by the surrounding GPT-2 layers.
 - **Standard LayerNorm**: Uses GPT-2-style LayerNorm instead of RMSNorm for architectural consistency.
+- **Learnable gated residual**: See below.
+
+### Learnable Gated Residual Connection
+
+A key challenge when inserting a randomly initialized TRM block into a transformer is that early in training, the TRM produces noisy outputs that degrade performance compared to a vanilla model. To solve this, the TRM block uses a **learnable gating scalar** `α` with a residual bypass:
+
+```
+output = α · TRM(x) + (1 − α) · x      where  α = sigmoid(gate)
+```
+
+The `gate` parameter is initialized to **-5**, so `sigmoid(-5) ≈ 0.007` — the block starts as a near-identity pass-through. As training progresses, the model learns to increase `α`, smoothly blending in the TRM refinement only once it becomes useful. This eliminates the early-training loss penalty that would otherwise occur from routing hidden states through an untrained reasoning module.
 
 ### MPS Optimization
 

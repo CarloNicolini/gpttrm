@@ -14,9 +14,7 @@ Key differences from original TRM code:
 - Positional information is already baked into the hidden states from GPT-2.
 """
 
-import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -165,8 +163,13 @@ class TRMBlock(nn.Module):
         self.z_L_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
         self.z_H_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
 
+        # Learnable gating scalar for residual connection.
+        # Initialized to -5 so that sigmoid(gate) ≈ 0.007 at the start,
+        # meaning the block initially acts as a near-identity pass-through.
+        # The model gradually learns to blend in the TRM refinement.
+        self.gate = nn.Parameter(torch.tensor(-5.0))
+
         # Projection to match GPT-2 hidden_size if needed (identity if sizes match)
-        # This is useful if we want TRM to operate at a different internal dimension
         self.proj_in = nn.Identity()
         self.proj_out = nn.Identity()
 
@@ -200,4 +203,7 @@ class TRMBlock(nn.Module):
             z_L = self.reasoning(z_L, z_H + x)
         z_H = self.reasoning(z_H, z_L)
 
-        return self.proj_out(z_H)
+        # Gated residual: output = α * trm_refined + (1 - α) * input
+        # where α = sigmoid(self.gate), starting near 0
+        alpha = torch.sigmoid(self.gate)
+        return self.proj_out(alpha * z_H + (1.0 - alpha) * x)
