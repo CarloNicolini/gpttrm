@@ -351,12 +351,27 @@ class GPT2TRMBase(pl.LightningModule):
             shift_labels = tokens[..., 1:].contiguous()
             mask = shift_labels != self.tokenizer.padding_index
 
-            # Iterate over all intermediate reasoning outputs
+            # --- Pivot A+B: Weighted Latent-Only Supervision ---
+            # We skip supervision on early cycles to allow "pure pondering" (Pivot B)
+            # and use increasing weights for later cycles (Pivot A).
+            num_cycles = len(deep_sup_logits)
+
+            # Example for 6 cycles: [0, 0, 0.1, 0.2, 0.4, 1.0]
+            # This forces the model to specialize Cycle 6 as the "solver" while
+            # allowing Cycles 1-3 to build internal representations freely.
+            cycle_weights = torch.linspace(0, 1, steps=num_cycles).to(loss.device)
+            # Thresholding: Zero out the first 50% of cycles (Latent Reasoning)
+            threshold = num_cycles // 2
+            cycle_weights[:threshold] = 0.0
+
+            # Normalize weights
+            cycle_weights = cycle_weights / (cycle_weights.sum() + 1e-8)
+
+            ds_loss = 0.0
             for h, inter_logits in enumerate(deep_sup_logits):
-                # 1. Deep Supervision (Cross Entropy towards correct token)
-                # We iteratively add all intermediate unrolled states
-                if h < len(deep_sup_logits) - 1:
-                    ds_loss += self.compute_loss(inter_logits, tokens)
+                w = cycle_weights[h]
+                if w > 0:
+                    ds_loss += w * self.compute_loss(inter_logits, tokens)
 
                 # 2. ACT Halting BCE
                 if halting_logits is not None:
@@ -372,14 +387,9 @@ class GPT2TRMBase(pl.LightningModule):
                     )
                     bce_loss += (bce * mask).sum() / mask.sum().clamp_min(1)
 
-            # Average and combine
-            num_cycles = len(deep_sup_logits)
-
-            # The previous code summed `loss + Average(Intermediates)`.
-            # If standard init loss is ~10, this results in `10 + 10 = 20`.
-            # We want to mathematically AVERAGE all steps:
-            # `(Final_Loss + Sum_Intermediates) / num_cycles`
-            loss = (loss + ds_loss) / max(1, num_cycles)
+            # Combined Loss
+            # We already averaged the ds_loss via cycle_weights normalization.
+            loss = ds_loss
 
             if halting_logits is not None:
                 bce_avg = bce_loss / num_cycles
