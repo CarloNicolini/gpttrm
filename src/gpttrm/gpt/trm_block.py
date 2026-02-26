@@ -135,16 +135,22 @@ class TRMReasoningLayer(nn.Module):
             self.norm1 = nn.LayerNorm(config.hidden_size)
             self.norm2 = nn.LayerNorm(config.hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-norm: normalize then apply function, add to original residual
-        # This is CRITICAL for stability in recurrent layers and deep transformers
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, x: torch.Tensor, injection: torch.Tensor = None) -> torch.Tensor:
+        # We form the conditioned state h for the sub-layers to read from.
+        # This prevents the injection (e.g. z_H + x) from accumulating geometrically
+        # inside the residual stream over dozens of recurrent cycles.
+        h = x if injection is None else x + injection
+
+        # Pre-norm: normalize conditioned state, then apply function, add to original residual
+        x = x + self.attn(self.norm1(h))
+
+        h = x if injection is None else x + injection
+        x = x + self.mlp(self.norm2(h))
         return x
 
 
 class TRMReasoningModule(nn.Module):
-    """Stack of TRM reasoning layers that form one recursion step."""
+    """Sequence of layers applied during one reasoning step."""
 
     def __init__(self, config: TRMBlockConfig):
         super().__init__()
@@ -155,9 +161,9 @@ class TRMReasoningModule(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, injection: torch.Tensor
     ) -> torch.Tensor:
-        x = hidden_states + injection
+        x = hidden_states
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, injection=injection)
         return x
 
 
