@@ -136,9 +136,10 @@ class TRMReasoningLayer(nn.Module):
             self.norm2 = nn.LayerNorm(config.hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Post-norm: add residual then normalize (matching TRM paper)
-        x = self.norm1(x + self.attn(x))
-        x = self.norm2(x + self.mlp(x))
+        # Pre-norm: normalize then apply function, add to original residual
+        # This is CRITICAL for stability in recurrent layers and deep transformers
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
