@@ -185,6 +185,12 @@ def inference(
 
     common_kwargs = dict(gpt2_config=gpt2_cfg, trm_config=trm_cfg)
 
+    # PyTorch 2.6+ defaults to weights_only=True and blocks custom classes in checkpoints.
+    # Our older checkpoints might have saved the configs directly.
+    import torch.serialization
+
+    torch.serialization.add_safe_globals([CustomGPT2Config, TRMBlockConfig])
+
     # Load from checkpoint
     print(f"Loading checkpoint from: {checkpoint_path}")
     if experiment == ExperimentType.baseline:
