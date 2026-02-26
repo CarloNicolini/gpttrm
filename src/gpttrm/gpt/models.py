@@ -149,6 +149,55 @@ class GPT2TRMBase(pl.LightningModule):
             shuffle=True,
         )
 
+    # --- Checkpoint Backward Compatibility ---
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Dynamically handles backward compatibility for checkpoints trained
+        prior to architectural modernizations.
+        """
+        state_dict = checkpoint["state_dict"]
+        keys = list(state_dict.keys())
+
+        # 1. Translate GPT-2 Attention from combined c_attn to split q_proj, k_proj, v_proj
+        for k in keys:
+            if k.endswith(".c_attn.weight"):
+                v = state_dict.pop(k)  # size is [3 * head_dim * n_head, n_embd]
+                q, k_proj, v_proj = v.chunk(3, dim=0)
+                prefix = k.replace(".c_attn.weight", "")
+                state_dict[prefix + ".q_proj.weight"] = q
+                state_dict[prefix + ".k_proj.weight"] = k_proj
+                state_dict[prefix + ".v_proj.weight"] = v_proj
+
+                b_key = k.replace(".weight", ".bias")
+                if b_key in state_dict:
+                    b = state_dict.pop(b_key)
+                    qb, kb, vb = b.chunk(3, dim=0)
+                    state_dict[prefix + ".q_proj.bias"] = qb
+                    state_dict[prefix + ".k_proj.bias"] = kb
+                    state_dict[prefix + ".v_proj.bias"] = vb
+
+        # 2. Handle legacy TRMMLP SwiGLU mismatches.
+        has_legacy_trm = any("mlp.gate_up_proj.weight" in k for k in keys)
+        if has_legacy_trm and not self.trm_config.modern:
+            for module in self.modules():
+                # Reconstruct TRMMLP to use modern SwiGLU logic dynamically
+                if type(module).__name__ == "TRMMLP":
+                    module.modern = True
+                    hidden_dim = self.trm_config.hidden_size * 4 // 2
+                    module.gate_up_proj = nn.Linear(
+                        self.trm_config.hidden_size, hidden_dim * 2, bias=False
+                    ).to(self.device)
+                    module.down_proj = nn.Linear(
+                        hidden_dim, self.trm_config.hidden_size, bias=False
+                    ).to(self.device)
+                    if hasattr(module, "c_fc"):
+                        del module.c_fc
+                    if hasattr(module, "c_proj"):
+                        del module.c_proj
+                    if hasattr(module, "gelu"):
+                        del module.gelu
+
     # --- Generation / Inference ---
 
     @torch.no_grad()

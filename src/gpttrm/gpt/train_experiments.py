@@ -186,23 +186,81 @@ def inference(
     common_kwargs = dict(gpt2_config=gpt2_cfg, trm_config=trm_cfg)
 
     # PyTorch 2.6+ defaults to weights_only=True and blocks custom classes in checkpoints.
-    # Our older checkpoints might have saved the configs directly.
     import torch.serialization
 
     torch.serialization.add_safe_globals([CustomGPT2Config, TRMBlockConfig])
 
-    # Load from checkpoint
     print(f"Loading checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["state_dict"]
+
+    # --- Legacy State Dict Translation ---
+    keys = list(state_dict.keys())
+    for k in keys:
+        if k.endswith(".c_attn.weight"):
+            v = state_dict.pop(k)
+            q, k_proj, v_proj = v.chunk(3, dim=0)
+            prefix = k.replace(".c_attn.weight", "")
+            state_dict[prefix + ".q_proj.weight"] = q
+            state_dict[prefix + ".k_proj.weight"] = k_proj
+            state_dict[prefix + ".v_proj.weight"] = v_proj
+
+            b_key = k.replace(".weight", ".bias")
+            if b_key in state_dict:
+                b = state_dict.pop(b_key)
+                qb, kb, vb = b.chunk(3, dim=0)
+                state_dict[prefix + ".q_proj.bias"] = qb
+                state_dict[prefix + ".k_proj.bias"] = kb
+                state_dict[prefix + ".v_proj.bias"] = vb
+
+    # Determine seq_len from wpe.weight shape if available
+    seq_len = 1024
+    for k in state_dict:
+        if "wpe.weight" in k:
+            seq_len = state_dict[k].shape[0]
+            break
+    gpt2_cfg.seq_len = seq_len
+
+    # --- Instantiate Model ---
     if experiment == ExperimentType.baseline:
-        model = GPT2Baseline.load_from_checkpoint(checkpoint_path, **common_kwargs)
+        model = GPT2Baseline(**common_kwargs)
     elif experiment == ExperimentType.option_a:
-        model = GPT2TRMOptionA.load_from_checkpoint(checkpoint_path, **common_kwargs)
+        model = GPT2TRMOptionA(**common_kwargs)
     elif experiment == ExperimentType.option_b:
-        model = GPT2TRMOptionB.load_from_checkpoint(
-            checkpoint_path, trm_insert_layer=trm_insert_layer, **common_kwargs
-        )
+        model = GPT2TRMOptionB(trm_insert_layer=trm_insert_layer, **common_kwargs)
     else:
         raise ValueError(f"Unknown experiment: {experiment}")
+
+    # Handle legacy TRMMLP SwiGLU dimensions (checkpoint might use 3/2 instead of 4/2)
+    has_legacy_trm = any("mlp.gate_up_proj.weight" in k for k in keys)
+    if has_legacy_trm and not modern:
+        for mn, module in model.named_modules():
+            if type(module).__name__ == "TRMMLP":
+                module.modern = True
+                # Detect hidden dim from checkpoint shape
+                weight_key = f"{mn}.gate_up_proj.weight"
+                if weight_key in state_dict:
+                    out_features = state_dict[weight_key].shape[0]
+                    hidden_dim = out_features // 2
+                    import torch.nn as nn
+
+                    module.gate_up_proj = nn.Linear(
+                        trm_cfg.hidden_size, hidden_dim * 2, bias=False
+                    )
+                    module.down_proj = nn.Linear(
+                        hidden_dim, trm_cfg.hidden_size, bias=False
+                    )
+                if hasattr(module, "c_fc"):
+                    del module.c_fc
+                if hasattr(module, "c_proj"):
+                    del module.c_proj
+                if hasattr(module, "gelu"):
+                    del module.gelu
+
+    # Load weights
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        print(f"Warning: Missing keys loading checkpoint: {missing_keys}")
 
     model.eval()
 

@@ -66,13 +66,15 @@ class TRMAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Non-causal attention (is_causal=False)
+        # Causal attention (is_causal=True) is CRITICAL here to prevent target leakage.
+        # If False, the LM will look at future tokens during training loss computation,
+        # resulting in artificial ~0 loss and broken autoregressive generation.
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False,
+            is_causal=True,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.dropout(self.o_proj(y))
