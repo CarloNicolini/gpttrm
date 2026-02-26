@@ -9,7 +9,12 @@ import typer
 
 from gpttrm.gpt.custom_gpt2 import CustomGPT2Config
 from gpttrm.gpt.trm_block import TRMBlockConfig
-from gpttrm.gpt.models import GPT2TRMOptionA, GPT2TRMOptionB, GPT2TRMBase
+from gpttrm.gpt.models import (
+    GPT2TRMOptionA,
+    GPT2TRMOptionB,
+    GPT2TRMOptionC,
+    GPT2TRMBase,
+)
 
 app = typer.Typer()
 
@@ -18,6 +23,7 @@ class ExperimentType(str, Enum):
     baseline = "baseline"
     option_a = "option_a"
     option_b = "option_b"
+    option_c = "option_c"
 
 
 class AcceleratorType(str, Enum):
@@ -107,6 +113,8 @@ def train(
         model = GPT2TRMOptionA(**common_kwargs)
     elif experiment == ExperimentType.option_b:
         model = GPT2TRMOptionB(trm_insert_layer=trm_insert_layer, **common_kwargs)
+    elif experiment == ExperimentType.option_c:
+        model = GPT2TRMOptionC(trm_insert_layer=trm_insert_layer, **common_kwargs)
     else:
         raise ValueError(f"Unknown experiment: {experiment}")
 
@@ -267,7 +275,13 @@ def inference(
     elif experiment == ExperimentType.option_a:
         model = GPT2TRMOptionA(**common_kwargs)
     elif experiment == ExperimentType.option_b:
-        model = GPT2TRMOptionB(trm_insert_layer=trm_insert_layer, **common_kwargs)
+        model = GPT2TRMOptionB.load_from_checkpoint(
+            checkpoint_path, trm_insert_layer=trm_insert_layer, **common_kwargs
+        )
+    elif experiment == ExperimentType.option_c:
+        model = GPT2TRMOptionC.load_from_checkpoint(
+            checkpoint_path, trm_insert_layer=trm_insert_layer, **common_kwargs
+        )
     else:
         raise ValueError(f"Unknown experiment: {experiment}")
 

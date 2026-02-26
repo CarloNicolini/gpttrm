@@ -179,6 +179,9 @@ class TRMBlock(nn.Module):
         # z_L and z_H are seeded directly from the input sequence x.
         self.gate = nn.Parameter(torch.tensor(-2.0))
 
+        # ACT Halting Head
+        self.halting_head = nn.Linear(config.hidden_size, 1)
+
         self.proj_in = nn.Identity()
         self.proj_out = nn.Identity()
 
@@ -196,17 +199,29 @@ class TRMBlock(nn.Module):
         z_L = x.clone()
 
         with torch.no_grad():
-            for _h in range(self.config.H_cycles - 1):
-                for _l in range(self.config.L_cycles):
-                    z_L = self.reasoning(z_L, z_H + x)
-                z_H = self.reasoning(z_H, z_L)
+            x_norm = x.norm(dim=-1).mean()
 
-        for _l in range(self.config.L_cycles):
-            z_L = self.reasoning(z_L, z_H + x)
-        z_H = self.reasoning(z_H, z_L)
+        intermediates = []
+        halting_logits = []
 
-        alpha = torch.sigmoid(self.gate)
-        output = self.proj_out(alpha * z_H + (1.0 - alpha) * x)
+        for h in range(self.config.H_cycles):
+            # Truncated BPTT: Detach latent states between cycles to prevent
+            # unrolled gradient explosions and OOM errors during Deep Supervision.
+            if h > 0:
+                z_H = z_H.detach()
+                z_L = z_L.detach()
+
+            for _l in range(self.config.L_cycles):
+                z_L = self.reasoning(z_L, z_H + x)
+            z_H = self.reasoning(z_H, z_L)
+
+            alpha = torch.sigmoid(self.gate)
+            cycle_out = self.proj_out(alpha * z_H + (1.0 - alpha) * x)
+
+            intermediates.append(cycle_out)
+            halting_logits.append(self.halting_head(cycle_out))
+
+        output = intermediates[-1]
 
         with torch.no_grad():
             x_norm = x.norm(dim=-1).mean()
@@ -226,6 +241,8 @@ class TRMBlock(nn.Module):
             "trm/input_norm": x_norm,
             "trm/z_L_z_H_cosine_sim": cosine_sim,
             "trm/gated_output_delta_norm": output_delta_norm,
+            "trm/intermediates": intermediates,
+            "trm/halting_logits": halting_logits,
         }
 
         return output, metrics

@@ -336,9 +336,50 @@ class GPT2TRMBase(pl.LightningModule):
         if isinstance(result, tuple):
             logits, trm_metrics = result
         else:
-            logits, trm_metrics = result, None
+            logits, trm_metrics = result, {}
 
         loss = self.compute_loss(logits, tokens)
+
+        # --- Deep Supervision & Halting ACT Loss ---
+        deep_sup_logits = trm_metrics.pop("trm/deep_supervision_logits", None)
+        halting_logits = trm_metrics.pop("trm/halting_logits", None)
+
+        if deep_sup_logits is not None:
+            ds_loss = 0.0
+            bce_loss = 0.0
+
+            shift_labels = tokens[..., 1:].contiguous()
+            mask = shift_labels != self.tokenizer.padding_index
+
+            # Iterate over all intermediate reasoning outputs
+            for h, inter_logits in enumerate(deep_sup_logits):
+                # 1. Deep Supervision (Cross Entropy towards correct token)
+                # (We don't add the final logits here as they are already `loss`)
+                if h < len(deep_sup_logits) - 1:
+                    ds_loss += self.compute_loss(inter_logits, tokens)
+
+                # 2. ACT Halting BCE
+                if halting_logits is not None:
+                    # Does the current cycle predict the right token?
+                    shift_preds = inter_logits[..., :-1, :].argmax(dim=-1)
+                    matches = (shift_preds == shift_labels).float()
+
+                    shift_halting = halting_logits[h][..., :-1, :].squeeze(-1)
+
+                    # Compute BCE only on unmasked (non-pad) tokens
+                    bce = F.binary_cross_entropy_with_logits(
+                        shift_halting, matches, reduction="none"
+                    )
+                    bce_loss += (bce * mask).sum() / mask.sum().clamp_min(1)
+
+            # Average and combine
+            num_cycles = len(deep_sup_logits)
+            loss = loss + (ds_loss / max(1, num_cycles - 1))
+
+            if halting_logits is not None:
+                bce_avg = bce_loss / num_cycles
+                loss = loss + 0.1 * bce_avg  # Weight halting loss lightly
+                self.log("train/bce_halting", bce_avg, on_step=True)
 
         # --- Core metrics ---
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -568,4 +609,87 @@ class GPT2TRMOptionB(GPT2TRMBase):
             end_layer=self.gpt2_config.n_layer,
         )
         logits = self.lm_head(hidden_states)
+        return logits, trm_metrics
+
+
+# ---------------------------------------------------------------------------
+# Option C: The Sandwich (Deep Supervision + Halting)
+# ---------------------------------------------------------------------------
+
+
+class GPT2TRMOptionC(GPT2TRMBase):
+    """
+    Option C: TRM replaces a block of middle GPT-2 layers (The Sandwich).
+    This design utilizes parameter reallocation to increase representational
+    depth via TRM without exceeding the original baseline parameter count.
+
+    It supports Truncated BPTT Deep Supervision by parallelizing intermediate
+    latent states through the upper network structure.
+    """
+
+    def __init__(self, trm_insert_layer: Optional[int] = None, **kwargs):
+        super().__init__(**kwargs)
+
+        # By default, cut out 4 layers from the middle
+        self.trm_start_layer = trm_insert_layer or (self.gpt2_config.n_layer // 2 - 2)
+        self.trm_end_layer = self.trm_start_layer + 4
+
+        self.gpt2 = CustomGPT2Model(self.gpt2_config)
+        self.trm_block = TRMBlock(self.trm_config)
+        self.lm_head = nn.Linear(
+            self.gpt2_config.n_embd, self.gpt2_config.vocab_size, bias=False
+        )
+        if self.gpt2_config.tie_word_embeddings:
+            self.lm_head.weight = self.gpt2.transformer.wte.weight
+
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        # First half of GPT-2 (Perception)
+        hidden_states = self.gpt2(
+            idx=tokens,
+            start_layer=0,
+            end_layer=self.trm_start_layer,
+        )
+
+        # TRM pondering replacing middle layers
+        refined, trm_metrics = self.trm_block(hidden_states)
+
+        intermediates = trm_metrics.pop("trm/intermediates", None)
+        halting_logits = trm_metrics.pop("trm/halting_logits", None)
+
+        if self.training and intermediates is not None:
+            # --- Deep Supervision Batch Processing ---
+            # To train all reasoning cycles (Truncated BPTT), we pass every
+            # intermediate reasoning state through the upper portion of GPT-2 at once.
+            B, T, D = intermediates[0].shape
+
+            # Stack intermediates along the batch dimension: (H*B, T, D)
+            stacked_h = torch.cat(intermediates, dim=0)
+
+            # Parallel evaluation through upper layers (Prediction / Routing)
+            stacked_refined = self.gpt2(
+                inputs_embeds=stacked_h,
+                start_layer=self.trm_end_layer,
+                end_layer=self.gpt2_config.n_layer,
+            )
+            # Evaluate the vocabulary logits for all cycles at once
+            all_logits = self.lm_head(stacked_refined)
+
+            # Split back into individual B-sized chunks
+            logits_list = list(all_logits.split(B, dim=0))
+
+            # Final output defaults to the very last reasoning cycle
+            logits = logits_list[-1]
+
+            # Hand back to training_step to compute Deep Supervision / BCE loss
+            trm_metrics["trm/deep_supervision_logits"] = logits_list
+            trm_metrics["trm/halting_logits"] = halting_logits
+        else:
+            # Inference mode: only process the single finalized 'refined' state
+            hidden_states = self.gpt2(
+                inputs_embeds=refined,
+                start_layer=self.trm_end_layer,
+                end_layer=self.gpt2_config.n_layer,
+            )
+            logits = self.lm_head(hidden_states)
+
         return logits, trm_metrics
