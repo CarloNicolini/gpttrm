@@ -46,6 +46,13 @@ class ExperimentType(str, Enum):
     option_b = "option-b"
 
 
+class AcceleratorType(str, Enum):
+    auto = "auto"
+    cpu = "cpu"
+    mps = "mps"
+    gpu = "gpu"
+
+
 # ---------------------------------------------------------------------------
 # Baseline: Vanilla GPT-2 (no TRM) for comparison
 # ---------------------------------------------------------------------------
@@ -88,6 +95,9 @@ def train(
     accumulate_grad_batches: int = typer.Option(1, help="Gradient accumulation steps."),
     loader_workers: int = typer.Option(
         0, help="DataLoader workers (0 is safest for MPS)."
+    ),
+    accelerator: AcceleratorType = typer.Option(
+        AcceleratorType.auto, help="Device: auto, cpu, mps, or gpu (cuda)."
     ),
     # GPT-2 architecture
     n_embd: int = typer.Option(256, help="GPT-2 embedding dimension."),
@@ -173,15 +183,19 @@ def train(
         LearningRateMonitor(logging_interval="step"),
     ]
 
-    if torch.backends.mps.is_available():
-        accelerator, devices = "mps", 1
-    elif torch.cuda.is_available():
-        accelerator, devices = "gpu", 1
+    if accelerator == AcceleratorType.auto:
+        if torch.backends.mps.is_available():
+            accel, devices = "mps", 1
+        elif torch.cuda.is_available():
+            accel, devices = "gpu", 1
+        else:
+            accel, devices = "cpu", "auto"
     else:
-        accelerator, devices = "cpu", "auto"
+        accel = accelerator.value
+        devices = 1 if accel in ("mps", "gpu") else "auto"
 
     trainer = pl.Trainer(
-        accelerator=accelerator,
+        accelerator=accel,
         devices=devices,
         logger=logger,
         callbacks=callbacks,
