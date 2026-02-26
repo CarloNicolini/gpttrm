@@ -135,17 +135,10 @@ class TRMReasoningLayer(nn.Module):
             self.norm1 = nn.LayerNorm(config.hidden_size)
             self.norm2 = nn.LayerNorm(config.hidden_size)
 
-    def forward(self, x: torch.Tensor, injection: torch.Tensor = None) -> torch.Tensor:
-        # We form the conditioned state h for the sub-layers to read from.
-        # This prevents the injection (e.g. z_H + x) from accumulating geometrically
-        # inside the residual stream over dozens of recurrent cycles.
-        h = x if injection is None else x + injection
-
-        # Pre-norm: normalize conditioned state, then apply function, add to original residual
-        x = x + self.attn(self.norm1(h))
-
-        h = x if injection is None else x + injection
-        x = x + self.mlp(self.norm2(h))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Standard Pre-norm: normalize conditioned state, then apply function, add to original residual
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -158,12 +151,10 @@ class TRMReasoningModule(nn.Module):
             [TRMReasoningLayer(config) for _ in range(config.n_reasoning_layers)]
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, injection: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = hidden_states
         for layer in self.layers:
-            x = layer(x, injection=injection)
+            x = layer(x)
         return x
 
 
@@ -176,8 +167,7 @@ class TRMBlock(nn.Module):
         self.reasoning = TRMReasoningModule(config)
 
         # We no longer use static initialization parameters;
-        # z_L and z_H are seeded directly from the input sequence x.
-        self.gate = nn.Parameter(torch.tensor(-2.0))
+        # y and z are seeded natively in the dual-residual Universal Transformer.
 
         # ACT Halting Head
         self.halting_head = nn.Linear(config.hidden_size, 1)
@@ -191,56 +181,61 @@ class TRMBlock(nn.Module):
         B, T, D = input_embeddings.shape
         x = self.proj_in(input_embeddings)
 
-        # --- Residual Seeding (Paper Implementation) ---
-        # Instead of static noise, we seed the internal reasoning (z_L) and
-        # current solution guess (z_H) with the actual contextualized input (x).
-        # This bridges GPT-2's latent space seamlessly into the TRM block.
-        z_H = x.clone()
-        z_L = x.clone()
+        # --- Dual-Residual Formulation (Universal Transformer) ---
+        # y is the active residual "solution" stream, bridged from GPT-2.
+        # z is the latent "memory" stream, initialized to zero.
+        y = x.clone()
+        z = torch.zeros_like(x)
 
-        with torch.no_grad():
-            x_norm = x.norm(dim=-1).mean()
+        if not hasattr(self, "halting_head"):
+            self.halting_head = nn.Linear(self.config.hidden_size, 1, device=x.device)
 
         intermediates = []
         halting_logits = []
 
-        for h in range(self.config.H_cycles):
+        # We unroll exactly L_cycles times, simulating 12 layers (6 cycles * 2 internal layers)
+        N = self.config.L_cycles
+
+        for n in range(N):
             # Truncated BPTT: Detach latent states between cycles to prevent
             # unrolled gradient explosions and OOM errors during Deep Supervision.
-            if h > 0:
-                z_H = z_H.detach()
-                z_L = z_L.detach()
+            if n > 0:
+                y = y.detach()
+                z = z.detach()
 
-            for _l in range(self.config.L_cycles):
-                z_L = self.reasoning(z_L, z_H + x)
-            z_H = self.reasoning(z_H, z_L)
+            # 1. Latent recursion
+            in_z = x + y + z
+            out_z = self.reasoning(in_z)
+            z = z + (out_z - in_z)
 
-            alpha = torch.sigmoid(self.gate)
-            cycle_out = self.proj_out(alpha * z_H + (1.0 - alpha) * x)
+            # 2. Solution refinement
+            in_y = y + z
+            out_y = self.reasoning(in_y)
+            y = y + (out_y - in_y)
 
-            intermediates.append(cycle_out)
-            halting_logits.append(self.halting_head(cycle_out))
+            intermediates.append(y)
+            halting_logits.append(self.halting_head(y))
 
         output = intermediates[-1]
 
         with torch.no_grad():
             x_norm = x.norm(dim=-1).mean()
-            z_H_norm = z_H.norm(dim=-1).mean()
-            delta = z_H - x
-            z_H_delta_norm = delta.norm(dim=-1).mean() / (x_norm + 1e-8)
-            z_L_flat = z_L.reshape(-1, D)
-            z_H_flat = z_H.reshape(-1, D)
-            cosine_sim = F.cosine_similarity(z_L_flat, z_H_flat, dim=-1).mean()
-            output_delta_norm = (output - x).norm(dim=-1).mean() / (x_norm + 1e-8)
+            y_norm = y.norm(dim=-1).mean()
+            z_norm = z.norm(dim=-1).mean()
+            y_delta_norm = (y - x).norm(dim=-1).mean() / (x_norm + 1e-8)
+            z_delta_norm = z.norm(dim=-1).mean() / (x_norm + 1e-8)
+
+            y_flat = y.reshape(-1, D)
+            z_flat = z.reshape(-1, D)
+            cosine_sim = F.cosine_similarity(y_flat, z_flat, dim=-1).mean()
 
         metrics = {
-            "trm/gate_alpha": alpha.detach(),
-            "trm/gate_raw": self.gate.detach(),
-            "trm/z_H_delta_norm": z_H_delta_norm,
-            "trm/z_H_norm": z_H_norm,
+            "trm/y_norm": y_norm,
+            "trm/z_norm": z_norm,
+            "trm/y_delta_norm": y_delta_norm,
+            "trm/z_delta_norm": z_delta_norm,
             "trm/input_norm": x_norm,
-            "trm/z_L_z_H_cosine_sim": cosine_sim,
-            "trm/gated_output_delta_norm": output_delta_norm,
+            "trm/y_z_cosine_sim": cosine_sim,
             "trm/intermediates": intermediates,
             "trm/halting_logits": halting_logits,
         }

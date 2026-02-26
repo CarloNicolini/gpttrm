@@ -294,7 +294,7 @@ class GPT2TRMBase(pl.LightningModule):
                 value,
                 on_step=(prefix == "train"),
                 on_epoch=True,
-                prog_bar=(key == "trm/gate_alpha"),
+                prog_bar=(key in ("trm/y_delta_norm", "trm/z_delta_norm")),
             )
 
     def _compute_gradient_norms(self) -> dict:
