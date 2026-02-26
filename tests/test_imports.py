@@ -1,17 +1,14 @@
-import torch
-import lightning.pytorch as pl
-from gpt2_lm import GPT2LanguageModel
 import argparse
+
+import lightning.pytorch as pl
+import torch
+
+from gpttrm.gpt2_lm import GPT2LanguageModel
+from gpttrm.gpt2_tokenizer import GPT2TextEncoder
 
 
 def test_imports():
     """Test that all required modules can be imported."""
-    import transformers
-    import pandas
-    import numpy
-    import lightning.pytorch
-
-    assert True
 
 
 def test_model_init():
@@ -30,7 +27,6 @@ def test_model_init():
 
 def test_tokenizer():
     """Test the tokenizer wrapper."""
-    from gpt2_tokenizer import GPT2TextEncoder
 
     tokenizer = GPT2TextEncoder("gpt2")
     text = "Hello, how are you?"
