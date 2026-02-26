@@ -1,0 +1,18 @@
+[project]
+name = "gpttrm"
+version = "0.1.0"
+description = "Minimalist GPT2 Generator with Tiny Recursive Models included"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch",
+    "lightning",
+    "transformers",
+    "pandas",
+    "numpy",
+    "tensorboard",
+    "pytest",
+]
+
+[tool.uv]
+package = true
