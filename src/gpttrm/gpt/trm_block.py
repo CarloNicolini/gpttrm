@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# Import RMSNorm from our custom_gpt2 to avoid duplication
-from gpttrm.gpt.custom_gpt2 import RMSNorm
+# Import modern components from custom_gpt2 to avoid duplication
+from gpttrm.gpt.custom_gpt2 import RMSNorm, RotaryPositionalEmbeddings
 
 
 @dataclass
@@ -42,21 +42,26 @@ class TRMBlockConfig:
 
 
 class TRMAttention(nn.Module):
-    """Bidirectional (non-causal) multi-head attention for the TRM block.
-
-    TRM uses non-causal attention because the recursion is refining a *complete*
-    hidden state, not generating tokens autoregressively.
-    """
+    """Multi-head attention for the TRM block with RoPE support if modern."""
 
     def __init__(self, config: TRMBlockConfig):
         super().__init__()
         assert config.hidden_size % config.n_head == 0
         self.n_head = config.n_head
         self.head_dim = config.hidden_size // config.n_head
+        self.modern = config.modern
 
-        self.qkv_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size)
-        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.qkv_proj = nn.Linear(
+            config.hidden_size, 3 * config.hidden_size, bias=not config.modern
+        )
+        self.o_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=not config.modern
+        )
         self.dropout = nn.Dropout(config.dropout)
+
+        if self.modern:
+            # Match GPT-2 seq_len for the RoPE cache
+            self.rope = RotaryPositionalEmbeddings(self.head_dim, 1024)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
@@ -65,6 +70,9 @@ class TRMAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        if self.modern:
+            q, k = self.rope(q, k)
 
         # Causal attention (is_causal=True) is CRITICAL here to prevent target leakage.
         # If False, the LM will look at future tokens during training loss computation,
@@ -127,6 +135,7 @@ class TRMReasoningLayer(nn.Module):
         super().__init__()
         self.attn = TRMAttention(config)
         self.mlp = TRMMLP(config)
+        self.modern = config.modern
 
         if config.modern:
             self.norm1 = RMSNorm(config.hidden_size)
@@ -136,9 +145,14 @@ class TRMReasoningLayer(nn.Module):
             self.norm2 = nn.LayerNorm(config.hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Standard Pre-norm: normalize conditioned state, then apply function, add to original residual
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        if self.modern:
+            # Modern mode uses Post-Norm with RMSNorm to match TRM paper stability
+            x = self.norm1(x + self.attn(x))
+            x = self.norm2(x + self.mlp(x))
+        else:
+            # Baseline uses standard Pre-Norm
+            x = x + self.attn(self.norm1(x))
+            x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -175,6 +189,12 @@ class TRMBlock(nn.Module):
         self.proj_in = nn.Identity()
         self.proj_out = nn.Identity()
 
+        # Non-persistent buffer for z_init to seed memory with a learned vector
+        # (Matched to the paper's H_init/L_init buffers)
+        self.register_buffer(
+            "z_init", torch.randn(config.hidden_size) * 0.02, persistent=False
+        )
+
     def forward(
         self, input_embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -183,9 +203,9 @@ class TRMBlock(nn.Module):
 
         # --- Dual-Residual Formulation (Universal Transformer) ---
         # y is the active residual "solution" stream, bridged from GPT-2.
-        # z is the latent "memory" stream, initialized to zero.
+        # z is the latent "memory" stream, initialized to a learned bias.
         y = x.clone()
-        z = torch.zeros_like(x)
+        z = self.z_init.view(1, 1, D).expand(B, T, D).clone()
 
         if not hasattr(self, "halting_head"):
             self.halting_head = nn.Linear(self.config.hidden_size, 1, device=x.device)
