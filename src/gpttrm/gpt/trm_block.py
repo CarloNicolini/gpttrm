@@ -173,13 +173,16 @@ class TRMBlock(nn.Module):
         self.proj_in = nn.Identity()
         self.proj_out = nn.Identity()
 
-    def forward(self, input_embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_embeddings: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Args:
             input_embeddings: (B, T, D) hidden states from GPT-2 layers.
 
         Returns:
-            z_H: (B, T, D) refined hidden states to feed into remaining GPT-2 layers.
+            output: (B, T, D) refined hidden states.
+            metrics: dict of scalar tensors for logging.
         """
         B, T, D = input_embeddings.shape
 
@@ -206,4 +209,33 @@ class TRMBlock(nn.Module):
         # Gated residual: output = α * trm_refined + (1 - α) * input
         # where α = sigmoid(self.gate), starting near 0
         alpha = torch.sigmoid(self.gate)
-        return self.proj_out(alpha * z_H + (1.0 - alpha) * x)
+        output = self.proj_out(alpha * z_H + (1.0 - alpha) * x)
+
+        # --- Compute diagnostic metrics (no grad to avoid memory overhead) ---
+        with torch.no_grad():
+            x_norm = x.norm(dim=-1).mean()
+            z_H_norm = z_H.norm(dim=-1).mean()
+
+            # How much TRM changes the hidden state relative to its magnitude
+            delta = z_H - x
+            z_H_delta_norm = delta.norm(dim=-1).mean() / (x_norm + 1e-8)
+
+            # Cosine similarity between z_L and z_H (convergence indicator)
+            z_L_flat = z_L.reshape(-1, D)
+            z_H_flat = z_H.reshape(-1, D)
+            cosine_sim = F.cosine_similarity(z_L_flat, z_H_flat, dim=-1).mean()
+
+            # Effective output change: how much the gated output differs from input
+            output_delta_norm = (output - x).norm(dim=-1).mean() / (x_norm + 1e-8)
+
+        metrics = {
+            "trm/gate_alpha": alpha.detach(),
+            "trm/gate_raw": self.gate.detach(),
+            "trm/z_H_delta_norm": z_H_delta_norm,
+            "trm/z_H_norm": z_H_norm,
+            "trm/input_norm": x_norm,
+            "trm/z_L_z_H_cosine_sim": cosine_sim,
+            "trm/gated_output_delta_norm": output_delta_norm,
+        }
+
+        return output, metrics

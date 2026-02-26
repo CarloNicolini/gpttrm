@@ -13,6 +13,8 @@ dependencies = [
     "tensorboard",
     "pytest",
     "typer>=0.24.1",
+    "setuptools<70",
+    "importlib-metadata",
 ]
 
 [project.scripts]
