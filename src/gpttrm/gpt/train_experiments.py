@@ -62,7 +62,7 @@ def train(
     trm_insert_layer: Optional[int] = typer.Option(
         None, help="For Option B, which layer to insert the TRM block after"
     ),
-    batch_size: int = 16,
+    batch_size: int = 64,
     max_epochs: int = 5,
     lr: float = 3e-4,
     n_layer: int = 6,
@@ -123,6 +123,46 @@ def train(
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
+    # Custom EMA Callback
+    import copy
+
+    class EMACallback(pl.Callback):
+        def __init__(self, decay=0.999):
+            super().__init__()
+            self.decay = decay
+            self.ema_model = None
+            self.original_state_dict = None
+
+        def on_train_start(self, trainer, pl_module):
+            # Create a detached copy for EMA
+            self.ema_model = copy.deepcopy(pl_module)
+            self.ema_model.to(pl_module.device)
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            with torch.no_grad():
+                for ema_param, param in zip(
+                    self.ema_model.parameters(), pl_module.parameters()
+                ):
+                    ema_param.data.mul_(self.decay).add_(
+                        param.data, alpha=1 - self.decay
+                    )
+
+        def on_validation_start(self, trainer, pl_module):
+            # Swap weights for validation
+            if self.ema_model is not None:
+                self.original_state_dict = copy.deepcopy(pl_module.state_dict())
+                pl_module.load_state_dict(self.ema_model.state_dict())
+
+        def on_validation_end(self, trainer, pl_module):
+            # Restore original weights
+            if self.original_state_dict is not None:
+                pl_module.load_state_dict(self.original_state_dict)
+                self.original_state_dict = None
+
+    callbacks = [checkpoint_callback, lr_monitor]
+    if experiment != ExperimentType.baseline:
+        callbacks.append(EMACallback(decay=0.999))
+
     # Trainer
     # Map AcceleratorType to Lightning string
     acc_val = accelerator.value
@@ -131,7 +171,7 @@ def train(
         accelerator=acc_val,
         devices=1,
         logger=logger,
-        callbacks=[checkpoint_callback, lr_monitor],
+        callbacks=callbacks,
         precision="16-mixed" if torch.cuda.is_available() else "32",
     )
 

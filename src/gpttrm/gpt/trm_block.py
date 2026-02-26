@@ -169,8 +169,8 @@ class TRMBlock(nn.Module):
         self.config = config
         self.reasoning = TRMReasoningModule(config)
 
-        self.z_L_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
-        self.z_H_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
+        # We no longer use static initialization parameters;
+        # z_L and z_H are seeded directly from the input sequence x.
         self.gate = nn.Parameter(torch.tensor(-2.0))
 
         self.proj_in = nn.Identity()
@@ -182,8 +182,12 @@ class TRMBlock(nn.Module):
         B, T, D = input_embeddings.shape
         x = self.proj_in(input_embeddings)
 
-        z_H = self.z_H_init.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
-        z_L = self.z_L_init.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+        # --- Residual Seeding (Paper Implementation) ---
+        # Instead of static noise, we seed the internal reasoning (z_L) and
+        # current solution guess (z_H) with the actual contextualized input (x).
+        # This bridges GPT-2's latent space seamlessly into the TRM block.
+        z_H = x.clone()
+        z_L = x.clone()
 
         with torch.no_grad():
             for _h in range(self.config.H_cycles - 1):
