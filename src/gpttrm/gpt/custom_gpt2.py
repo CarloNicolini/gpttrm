@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -18,24 +18,107 @@ class CustomGPT2Config:
     # Use True if you want to tie the word embeddings to the final lm_head weights
     tie_word_embeddings: bool = True
 
+    # -- Modernization Flags --
+    modern: bool = False
+    n_kv_head: Optional[int] = None  # For GQA (Grouped Query Attention)
+    rope_theta: float = 10000.0  # Base frequency for RoPE
+
+
+# ---------------------------------------------------------------------------
+# Modern Components: RMSNorm, RoPE, SwiGLU
+# ---------------------------------------------------------------------------
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Normalization (used in Llama/SmolLM)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
+class RotaryPositionalEmbeddings(nn.Module):
+    """Simple RoPE implementation."""
+
+    def __init__(self, dim: int, max_seq_len: int = 2048, theta: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self._set_cos_sin_cache(max_seq_len)
+
+    def _set_cos_sin_cache(self, seq_len: int):
+        t = torch.arange(seq_len).type_as(self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+
+    def forward(self, q, k):
+        # q, k: (B, H, T, D)
+        T = q.shape[2]
+        cos = self.cos_cached[:, :, :T, :]
+        sin = self.sin_cached[:, :, :T, :]
+
+        def rotate_half(x):
+            x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        q_rope = (q * cos) + (rotate_half(q) * sin)
+        k_rope = (k * cos) + (rotate_half(k) * sin)
+        return q_rope, k_rope
+
+
+# ---------------------------------------------------------------------------
+# GPT-2 Components (Updated with Modern support)
+# ---------------------------------------------------------------------------
+
 
 class CustomGPT2Attention(nn.Module):
     def __init__(self, config: CustomGPT2Config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.config = config
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
 
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # GQA Support
+        self.n_kv_head = (
+            config.n_kv_head if (config.modern and config.n_kv_head) else config.n_head
+        )
+        self.n_groups = self.n_head // self.n_kv_head
+
+        # Projections
+        self.q_proj = nn.Linear(
+            config.n_embd, config.n_head * self.head_dim, bias=not config.modern
+        )
+        self.k_proj = nn.Linear(
+            config.n_embd, self.n_kv_head * self.head_dim, bias=not config.modern
+        )
+        self.v_proj = nn.Linear(
+            config.n_embd, self.n_kv_head * self.head_dim, bias=not config.modern
+        )
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=not config.modern)
+
+        # RoPE
+        if config.modern:
+            self.rope = RotaryPositionalEmbeddings(
+                self.head_dim, config.seq_len, config.rope_theta
+            )
 
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # causal mask
+        # causal mask (fallback for non-flash)
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.seq_len, config.seq_len)).view(
@@ -44,31 +127,30 @@ class CustomGPT2Attention(nn.Module):
         )
 
     def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        # Flash attention natively supported in PyTorch >= 2.0 via scaled_dot_product_attention
+        if self.config.modern:
+            q, k = self.rope(q, k)
+
+            # GQA: Repeat k, v groups if necessary
+            if self.n_kv_head != self.n_head:
+                k = k.repeat_interleave(self.n_groups, dim=1)
+                v = v.repeat_interleave(self.n_groups, dim=1)
+
+        # Scaled Dot Product Attention
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
-            is_causal=True,
+            is_causal=True if not self.config.modern else True,  # Always causal for GPT
         )
 
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-
-        # output projection
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -76,15 +158,35 @@ class CustomGPT2Attention(nn.Module):
 class CustomGPT2MLP(nn.Module):
     def __init__(self, config: CustomGPT2Config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.modern = config.modern
+
+        if self.modern:
+            # SwiGLU: Uses 3 projections (gate, up, down)
+            # Standard hidden dim is often 8/3 * n_embd for SwiGLU to match param count of 4 * n_embd GELU
+            # But we'll keep it simple: use 2/3 * (4 * n_embd) to keep parity or just stay with 4.
+            hidden_dim = 4 * config.n_embd
+            self.gate_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.up_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+            self.gelu = nn.GELU(approximate="tanh")
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        if self.modern:
+            # SwiGLU(x) = (SiLU(xW) * xV)W_down
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            x = F.silu(gate) * up
+            x = self.down_proj(x)
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
+
         x = self.dropout(x)
         return x
 
@@ -92,9 +194,14 @@ class CustomGPT2MLP(nn.Module):
 class CustomGPT2Block(nn.Module):
     def __init__(self, config: CustomGPT2Config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        if config.modern:
+            self.ln_1 = RMSNorm(config.n_embd)
+            self.ln_2 = RMSNorm(config.n_embd)
+        else:
+            self.ln_1 = nn.LayerNorm(config.n_embd)
+            self.ln_2 = nn.LayerNorm(config.n_embd)
+
         self.attn = CustomGPT2Attention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = CustomGPT2MLP(config)
 
     def forward(self, x):
@@ -111,26 +218,33 @@ class CustomGPT2Model(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.seq_len, config.n_embd),
                 drop=nn.Dropout(config.dropout),
                 h=nn.ModuleList(
                     [CustomGPT2Block(config) for _ in range(config.n_layer)]
                 ),
-                ln_f=nn.LayerNorm(config.n_embd),
+                ln_f=RMSNorm(config.n_embd)
+                if config.modern
+                else nn.LayerNorm(config.n_embd),
             )
         )
 
+        # Only add absolute PEs if NOT modern (RoPE replaces them)
+        if not config.modern:
+            self.transformer.wpe = nn.Embedding(config.seq_len, config.n_embd)
+
         # init all weights
         self.apply(self._init_weights)
+
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
+            if pn.endswith("c_proj.weight") or pn.endswith("down_proj.weight"):
                 torch.nn.init.normal_(
                     p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
+            # Normal init for projections
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -144,39 +258,28 @@ class CustomGPT2Model(nn.Module):
         start_layer: int = 0,
         end_layer: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        Allows passing either tokens (idx) or raw floating embeddings (inputs_embeds).
-        Also allows running a subset of layers from [start_layer : end_layer).
-        This makes inserting mid-layer "pondering" blocks trivial.
-        """
         device = idx.device if idx is not None else inputs_embeds.device
 
         if (idx is not None) and (inputs_embeds is None):
             b, t = idx.size()
-            assert t <= self.config.seq_len, (
-                f"Cannot forward sequence of length {t}, block size is only {self.config.seq_len}"
-            )
-            pos = torch.arange(0, t, dtype=torch.long, device=device)
-            # forward the GPT model itself
-            tok_emb = self.transformer.wte(
-                idx
-            )  # token embeddings of shape (b, t, n_embd)
-            pos_emb = self.transformer.wpe(
-                pos
-            )  # position embeddings of shape (t, n_embd)
-            x = self.transformer.drop(tok_emb + pos_emb)
+            x = self.transformer.wte(idx)
+
+            # Add absolute PEs if NOT modern
+            if not self.config.modern:
+                pos = torch.arange(0, t, dtype=torch.long, device=device)
+                pos_emb = self.transformer.wpe(pos)
+                x = x + pos_emb
+
+            x = self.transformer.drop(x)
         elif (inputs_embeds is not None) and (idx is None):
-            # If resuming mid-way, inputs_embeds is literally just the hidden state x being passed back in.
-            # No positional encodings are added again since x should already include them if start_layer > 0.
-            # If start_layer == 0 but we passed soft prompts, we should add pos embeddings.
-            # For simplicity: if start_layer > 0, we assume x is an intermediate hidden state.
-            if start_layer == 0:
+            x = inputs_embeds
+            # If start_layer == 0 and NOT modern, we might need PEs
+            # But usually we pass hidden states that already have them.
+            if start_layer == 0 and not self.config.modern:
                 b, t, _ = inputs_embeds.size()
                 pos = torch.arange(0, t, dtype=torch.long, device=device)
                 pos_emb = self.transformer.wpe(pos)
                 x = self.transformer.drop(inputs_embeds + pos_emb)
-            else:
-                x = inputs_embeds
         else:
             raise ValueError("Pass either idx or inputs_embeds, not both.")
 
@@ -187,7 +290,7 @@ class CustomGPT2Model(nn.Module):
         for block in self.transformer.h[start_layer:end_layer]:
             x = block(x)
 
-        # Only layer-norm if we are at the very end
+        # Only final-norm if we are at the very end
         if end_layer == self.config.n_layer:
             x = self.transformer.ln_f(x)
 

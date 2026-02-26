@@ -12,14 +12,60 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 
-from gpttrm.gpt.custom_gpt2 import CustomGPT2Config, CustomGPT2Model
+from gpttrm.gpt.custom_gpt2 import CustomGPT2Config, CustomGPT2Model, RMSNorm
 from gpttrm.gpt.trm_block import TRMBlockConfig, TRMBlock
 from gpttrm.gpt.gpt2_tokenizer import GPT2TextEncoder
 from gpttrm.gpt.dataloader import text_dataset
+
+
+# ---------------------------------------------------------------------------
+# WSD (Warmup-Stable-Decay) Scheduler Logic
+# ---------------------------------------------------------------------------
+
+
+class WSDScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Warmup-Stable-Decay Scheduler.
+    1. Warmup: Linear increase from 0 to peak_lr.
+    2. Stable: Constant peak_lr.
+    3. Decay: Linear or Cosine decay to min_lr.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        warmup_steps: int,
+        stable_steps: int,
+        total_steps: int,
+        min_lr: float = 0.0,
+        last_epoch: int = -1,
+    ):
+        self.warmup_steps = warmup_steps
+        self.stable_steps = stable_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch
+        if step < self.warmup_steps:
+            # Linear Warmup
+            scale = step / max(1, self.warmup_steps)
+        elif step < self.warmup_steps + self.stable_steps:
+            # Stable phase
+            scale = 1.0
+        else:
+            # Linear Decay
+            decay_steps = self.total_steps - (self.warmup_steps + self.stable_steps)
+            current_decay_step = step - (self.warmup_steps + self.stable_steps)
+            scale = 1.0 - (current_decay_step / max(1, decay_steps))
+            scale = max(0.0, scale)
+
+        return [max(self.min_lr, base_lr * scale) for base_lr in self.base_lrs]
 
 
 # ---------------------------------------------------------------------------
@@ -35,18 +81,28 @@ class GPT2TRMBase(pl.LightningModule):
         gpt2_config: CustomGPT2Config,
         trm_config: TRMBlockConfig,
         learning_rate: float = 3e-4,
+        lr_scheduler_type: str = "cosine",  # "cosine" or "wsd"
+        warmup_steps: int = 2000,
         train_csv: str = "data/train_data.csv",
         dev_csv: str = "data/valid_data.csv",
         test_csv: str = "data/valid_data.csv",
         batch_size: int = 8,
         loader_workers: int = 0,
+        total_steps: int = 100000,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["gpt2_config", "trm_config"])
 
         self.gpt2_config = gpt2_config
         self.trm_config = trm_config
+        # Ensure TRM respects the modern flag
+        self.trm_config.modern = self.gpt2_config.modern
+
         self.learning_rate = learning_rate
+        self.lr_scheduler_type = lr_scheduler_type
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+
         self.train_csv = train_csv
         self.dev_csv = dev_csv
         self.test_csv = test_csv
@@ -92,6 +148,50 @@ class GPT2TRMBase(pl.LightningModule):
             num_workers=self.loader_workers,
             shuffle=True,
         )
+
+    # --- Generation / Inference ---
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_tokens: torch.Tensor,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ) -> torch.Tensor:
+        """
+        Generates new tokens autoregressively from a given prompt.
+        Args:
+            prompt_tokens: (B, T) tensor of input token IDs.
+            max_new_tokens: Number of tokens to generate.
+            temperature: Sampling temperature (1.0 = standard, <1.0 = greedy).
+            top_k: Top-k sampling filter.
+        """
+        self.eval()
+        for _ in range(max_new_tokens):
+            # Crop to context length if needed
+            cond_idx = prompt_tokens[:, -self.gpt2_config.seq_len :]
+
+            result = self(cond_idx)
+            # Unpack if model returns (logits, metrics)
+            if isinstance(result, tuple):
+                logits, _ = result
+            else:
+                logits = result
+
+            # Pondering models might return very interesting sequences
+            # Take logits from the final step and scale
+            logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("Inf")
+
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            prompt_tokens = torch.cat((prompt_tokens, idx_next), dim=1)
+
+        return prompt_tokens
 
     def val_dataloader(self) -> DataLoader:
         from argparse import Namespace
@@ -257,9 +357,96 @@ class GPT2TRMBase(pl.LightningModule):
             self.log("perplexity", perplexity, prog_bar=False)  # backward compat
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
-            self.parameters(), lr=self.learning_rate, weight_decay=0.01
+        """
+        Setup optimizer with selective weight decay.
+        Excludes: biases, LayerNorm/RMSNorm weights, and Embeddings.
+        """
+        # Separate parameters into decay and no_decay groups
+        decay = set()
+        no_decay = set()
+
+        # Modules that should have weight decay on their weights
+        whitelist_weight_modules = (torch.nn.Linear,)
+        # Modules that should NOT have weight decay
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm)
+
+        # We need to track parameters by their identity to handle tied weights
+        param_to_name = {p: n for n, p in self.named_parameters()}
+        unique_params = list(param_to_name.keys())
+
+        for m in self.modules():
+            for pn, p in m.named_parameters():
+                if p not in param_to_name:
+                    continue
+
+                full_name = param_to_name[p]
+
+                if pn.endswith("bias"):
+                    no_decay.add(p)
+                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
+                    decay.add(p)
+                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(p)
+                elif (
+                    "z_L_init" in full_name
+                    or "z_H_init" in full_name
+                    or "gate" in full_name
+                ):
+                    no_decay.add(p)
+
+        # Catch-all for any missed parameters
+        for p in unique_params:
+            if p not in decay and p not in no_decay:
+                no_decay.add(p)
+
+        # Final check: any parameter in both? (shouldn't happen with set logic but good to be careful)
+        decay = decay - no_decay
+
+        optim_groups = [
+            {
+                "params": sorted(list(decay), key=lambda p: param_to_name[p]),
+                "weight_decay": 0.01,
+            },
+            {
+                "params": sorted(list(no_decay), key=lambda p: param_to_name[p]),
+                "weight_decay": 0.0,
+            },
+        ]
+
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=self.learning_rate, betas=(0.9, 0.95)
         )
+
+        # --- Multi-Scheduler Support ---
+        if self.lr_scheduler_type == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.total_steps, eta_min=self.learning_rate * 0.1
+            )
+        elif self.lr_scheduler_type == "wsd":
+            # 10% cooldown as per SmolLM recommendation
+            warmup = self.warmup_steps
+            decay_p = 0.1
+            decay_steps = int(self.total_steps * decay_p)
+            stable_steps = self.total_steps - warmup - decay_steps
+
+            scheduler = WSDScheduler(
+                optimizer,
+                warmup_steps=warmup,
+                stable_steps=stable_steps,
+                total_steps=self.total_steps,
+                min_lr=self.learning_rate * 0.1,
+            )
+        else:
+            return optimizer
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
 
 # ---------------------------------------------------------------------------

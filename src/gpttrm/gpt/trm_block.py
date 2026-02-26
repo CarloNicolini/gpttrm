@@ -10,7 +10,6 @@ token inputs, making it a drop-in "pondering" module between GPT-2 layers.
 Key differences from original TRM code:
 - No discrete embedding / lm_head (those live in the outer GPT-2 wrapper).
 - No puzzle embeddings or sparse embeddings.
-- Uses standard LayerNorm instead of RMSNorm for consistency with GPT-2.
 - Positional information is already baked into the hidden states from GPT-2.
 """
 
@@ -19,6 +18,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# Import RMSNorm from our custom_gpt2 to avoid duplication
+from gpttrm.gpt.custom_gpt2 import RMSNorm
 
 
 @dataclass
@@ -34,6 +36,9 @@ class TRMBlockConfig:
     L_cycles: int = 6  # Inner recursion steps per full cycle
     H_cycles: int = 3  # Outer supervision cycles (T in paper)
     dropout: float = 0.1
+
+    # -- Modernization Toggle --
+    modern: bool = False
 
 
 class TRMAttention(nn.Module):
@@ -74,33 +79,59 @@ class TRMAttention(nn.Module):
 
 
 class TRMMLP(nn.Module):
-    """SwiGLU-style MLP used inside the TRM reasoning layers."""
+    """MLP used inside the TRM reasoning layers. Supports SwiGLU (modern) or GELU (baseline)."""
 
     def __init__(self, config: TRMBlockConfig):
         super().__init__()
-        inter_size = int(config.expansion * config.hidden_size * 2 / 3)
-        # Round up to nearest multiple of 64 for efficiency
-        inter_size = ((inter_size + 63) // 64) * 64
+        self.modern = config.modern
 
-        self.gate_up_proj = nn.Linear(config.hidden_size, inter_size * 2, bias=False)
-        self.down_proj = nn.Linear(inter_size, config.hidden_size, bias=False)
+        if self.modern:
+            # SwiGLU
+            inter_size = int(config.expansion * config.hidden_size * 2 / 3)
+            inter_size = ((inter_size + 63) // 64) * 64
+            self.gate_up_proj = nn.Linear(
+                config.hidden_size, inter_size * 2, bias=False
+            )
+            self.down_proj = nn.Linear(inter_size, config.hidden_size, bias=False)
+        else:
+            # Standard GPT-2 style MLP
+            inter_size = int(config.expansion * config.hidden_size)
+            self.c_fc = nn.Linear(config.hidden_size, inter_size)
+            self.gelu = nn.GELU(approximate="tanh")
+            self.c_proj = nn.Linear(inter_size, config.hidden_size)
+
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        if self.modern:
+            gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+            x = self.down_proj(F.silu(gate) * up)
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
+
+        return self.dropout(x)
 
 
 class TRMReasoningLayer(nn.Module):
     """A single transformer-style layer inside the TRM reasoning module.
-    Uses Post-Norm (as in the original TRM paper) with residual connections.
+    GPT-2 Style: Pre-Norm (standard for stability) or TRM Style: Post-Norm (original paper).
+    Actually, to match the user's "previous version", I'll keep the Post-Norm logic
+    but toggle LayerNorm vs RMSNorm.
     """
 
     def __init__(self, config: TRMBlockConfig):
         super().__init__()
         self.attn = TRMAttention(config)
         self.mlp = TRMMLP(config)
-        self.norm1 = nn.LayerNorm(config.hidden_size)
-        self.norm2 = nn.LayerNorm(config.hidden_size)
+
+        if config.modern:
+            self.norm1 = RMSNorm(config.hidden_size)
+            self.norm2 = RMSNorm(config.hidden_size)
+        else:
+            self.norm1 = nn.LayerNorm(config.hidden_size)
+            self.norm2 = nn.LayerNorm(config.hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Post-norm: add residual then normalize (matching TRM paper)
@@ -110,11 +141,7 @@ class TRMReasoningLayer(nn.Module):
 
 
 class TRMReasoningModule(nn.Module):
-    """Stack of TRM reasoning layers that form one recursion step.
-
-    Following the paper: this module takes a hidden state and an injection
-    signal, sums them, and passes through the reasoning layers.
-    """
+    """Stack of TRM reasoning layers that form one recursion step."""
 
     def __init__(self, config: TRMBlockConfig):
         super().__init__()
@@ -125,14 +152,6 @@ class TRMReasoningModule(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, injection: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states: The state being refined (z_L or z_H).
-            injection: Additive signal (e.g. z_H + input_emb for z_L update,
-                       or z_L for z_H update).
-        Returns:
-            Refined hidden states.
-        """
         x = hidden_states + injection
         for layer in self.layers:
             x = layer(x)
@@ -140,92 +159,50 @@ class TRMReasoningModule(nn.Module):
 
 
 class TRMBlock(nn.Module):
-    """Complete TRM pondering block operating on continuous hidden states.
-
-    Implements the full recursion loop from the TRM paper:
-      - T-1 outer cycles WITHOUT gradient (to improve z_L, z_H cheaply)
-      - 1 outer cycle WITH gradient (for backpropagation)
-      - Each outer cycle = n inner L-cycles + 1 H-cycle
-
-    Uses a SINGLE shared reasoning module (Section 4.3 of the paper).
-
-    Input:  hidden_states (B, T, D) from GPT-2
-    Output: refined hidden_states (B, T, D)
-    """
+    """Complete TRM pondering block operating on continuous hidden states."""
 
     def __init__(self, config: TRMBlockConfig):
         super().__init__()
         self.config = config
-        # Single shared reasoning module (key insight from TRM paper: one network suffices)
         self.reasoning = TRMReasoningModule(config)
 
-        # Learnable initial states for z_L and z_H
         self.z_L_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
         self.z_H_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
-
-        # Learnable gating scalar for residual connection.
-        # Initialized to -5 so that sigmoid(gate) ≈ 0.007 at the start,
-        # meaning the block initially acts as a near-identity pass-through.
-        # The model gradually learns to blend in the TRM refinement.
         self.gate = nn.Parameter(torch.tensor(-5.0))
 
-        # Projection to match GPT-2 hidden_size if needed (identity if sizes match)
         self.proj_in = nn.Identity()
         self.proj_out = nn.Identity()
 
     def forward(
         self, input_embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Args:
-            input_embeddings: (B, T, D) hidden states from GPT-2 layers.
-
-        Returns:
-            output: (B, T, D) refined hidden states.
-            metrics: dict of scalar tensors for logging.
-        """
         B, T, D = input_embeddings.shape
-
         x = self.proj_in(input_embeddings)
 
-        # Initialize z_H (solution state) and z_L (latent reasoning state)
         z_H = self.z_H_init.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
         z_L = self.z_L_init.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
 
-        # H_cycles - 1 cycles WITHOUT gradient (cheap forward-only pondering)
         with torch.no_grad():
             for _h in range(self.config.H_cycles - 1):
                 for _l in range(self.config.L_cycles):
-                    # Update latent reasoning: z_L sees (z_H + input)
                     z_L = self.reasoning(z_L, z_H + x)
-                # Update solution: z_H sees z_L
                 z_H = self.reasoning(z_H, z_L)
 
-        # 1 final cycle WITH gradient (for training)
         for _l in range(self.config.L_cycles):
             z_L = self.reasoning(z_L, z_H + x)
         z_H = self.reasoning(z_H, z_L)
 
-        # Gated residual: output = α * trm_refined + (1 - α) * input
-        # where α = sigmoid(self.gate), starting near 0
         alpha = torch.sigmoid(self.gate)
         output = self.proj_out(alpha * z_H + (1.0 - alpha) * x)
 
-        # --- Compute diagnostic metrics (no grad to avoid memory overhead) ---
         with torch.no_grad():
             x_norm = x.norm(dim=-1).mean()
             z_H_norm = z_H.norm(dim=-1).mean()
-
-            # How much TRM changes the hidden state relative to its magnitude
             delta = z_H - x
             z_H_delta_norm = delta.norm(dim=-1).mean() / (x_norm + 1e-8)
-
-            # Cosine similarity between z_L and z_H (convergence indicator)
             z_L_flat = z_L.reshape(-1, D)
             z_H_flat = z_H.reshape(-1, D)
             cosine_sim = F.cosine_similarity(z_L_flat, z_H_flat, dim=-1).mean()
-
-            # Effective output change: how much the gated output differs from input
             output_delta_norm = (output - x).norm(dim=-1).mean() / (x_norm + 1e-8)
 
         metrics = {

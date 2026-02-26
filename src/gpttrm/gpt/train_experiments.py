@@ -1,49 +1,23 @@
-"""
-Unified training CLI for GPT-2 + TRM experiments.
-
-Usage:
-    # Option A (TRM as post-GPT2 reasoner):
-    gpttrm-cli train --experiment option-a
-
-    # Option B (TRM interspersed mid-layer):
-    gpttrm-cli train --experiment option-b
-
-    # Baseline (vanilla custom GPT-2, no TRM):
-    gpttrm-cli train --experiment baseline
-
-All experiments log to TensorBoard under experiments/<experiment_name>.
-Designed for Apple Silicon MPS with reduced model dimensions.
-"""
-
-import os
 from enum import Enum
 from typing import Optional
 
 import torch
-import typer
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import (
-    EarlyStopping,
-    ModelCheckpoint,
-    LearningRateMonitor,
-)
 from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+import typer
 
 from gpttrm.gpt.custom_gpt2 import CustomGPT2Config
 from gpttrm.gpt.trm_block import TRMBlockConfig
-from gpttrm.gpt.models import GPT2TRMOptionA, GPT2TRMOptionB
+from gpttrm.gpt.models import GPT2TRMOptionA, GPT2TRMOptionB, GPT2TRMBase
 
-app = typer.Typer(
-    name="gpttrm-cli",
-    help="GPT-2 + TRM Training Experiments CLI",
-    add_completion=False,
-)
+app = typer.Typer()
 
 
 class ExperimentType(str, Enum):
     baseline = "baseline"
-    option_a = "option-a"
-    option_b = "option-b"
+    option_a = "option_a"
+    option_b = "option_b"
 
 
 class AcceleratorType(str, Enum):
@@ -53,13 +27,20 @@ class AcceleratorType(str, Enum):
     gpu = "gpu"
 
 
-# ---------------------------------------------------------------------------
-# Baseline: Vanilla GPT-2 (no TRM) for comparison
-# ---------------------------------------------------------------------------
+class GPT2Baseline(GPT2TRMBase):
+    """Simple baseline: Standard GPT-2 without TRM reasoning block."""
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        from gpttrm.gpt.custom_gpt2 import CustomGPT2Model
+        import torch.nn as nn
 
-class GPT2Baseline(GPT2TRMOptionA):
-    """Vanilla custom GPT-2 baseline without the TRM block."""
+        self.gpt2 = CustomGPT2Model(self.gpt2_config)
+        self.lm_head = nn.Linear(
+            self.gpt2_config.n_embd, self.gpt2_config.vocab_size, bias=False
+        )
+        if self.gpt2_config.tie_word_embeddings:
+            self.lm_head.weight = self.gpt2.transformer.wte.weight
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         hidden_states = self.gpt2(idx=tokens)
@@ -67,146 +48,181 @@ class GPT2Baseline(GPT2TRMOptionA):
         return logits
 
 
-def _build_model(
-    experiment: ExperimentType, gpt2_config, trm_config, common_kwargs, trm_insert_layer
+@app.command()
+def train(
+    experiment: ExperimentType = typer.Option(
+        ExperimentType.baseline, help="Which model variant to train"
+    ),
+    modern: bool = typer.Option(
+        False, help="Whether to use modern architecture (RMSNorm, RoPE, SwiGLU, GQA)"
+    ),
+    accelerator: AcceleratorType = typer.Option(
+        AcceleratorType.auto, help="Device accelerator to use (auto, cpu, mps, gpu)"
+    ),
+    trm_insert_layer: Optional[int] = typer.Option(
+        None, help="For Option B, which layer to insert the TRM block after"
+    ),
+    batch_size: int = 16,
+    max_epochs: int = 5,
+    lr: float = 3e-4,
+    n_layer: int = 6,
+    n_head: int = 4,
+    n_embd: int = 128,
+    h_cycles: int = 2,
+    l_cycles: int = 2,
+    n_reasoning_layers: int = 2,
+    scheduler: str = typer.Option("wsd", help="Learning rate scheduler: cosine or wsd"),
+    warmup_steps: int = 500,
 ):
+    # Setup configs
+    gpt2_cfg = CustomGPT2Config(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        modern=modern,
+        n_kv_head=n_head // 2 if modern else None,  # Example GQA ratio
+    )
+    trm_cfg = TRMBlockConfig(
+        hidden_size=n_embd,
+        n_head=n_head,
+        H_cycles=h_cycles,
+        L_cycles=l_cycles,
+        n_reasoning_layers=n_reasoning_layers,
+        modern=modern,
+    )
+
+    # Instantiate model
+    common_kwargs = dict(
+        gpt2_config=gpt2_cfg,
+        trm_config=trm_cfg,
+        learning_rate=lr,
+        lr_scheduler_type=scheduler,
+        warmup_steps=warmup_steps,
+        batch_size=batch_size,
+    )
+
     if experiment == ExperimentType.baseline:
-        return GPT2Baseline(**common_kwargs)
+        model = GPT2Baseline(**common_kwargs)
     elif experiment == ExperimentType.option_a:
-        return GPT2TRMOptionA(**common_kwargs)
+        model = GPT2TRMOptionA(**common_kwargs)
     elif experiment == ExperimentType.option_b:
-        return GPT2TRMOptionB(trm_insert_layer=trm_insert_layer, **common_kwargs)
+        model = GPT2TRMOptionB(trm_insert_layer=trm_insert_layer, **common_kwargs)
     else:
         raise ValueError(f"Unknown experiment: {experiment}")
 
+    # Logger
+    exp_suffix = "modern" if modern else "standard"
+    logger = TensorBoardLogger("experiments", name=f"{experiment.value}_{exp_suffix}")
 
-@app.callback(invoke_without_command=True)
-def train(
-    experiment: ExperimentType = typer.Option(
-        ExperimentType.baseline, help="Which experiment to run."
-    ),
-    # Training
-    seed: int = typer.Option(42, help="Random seed."),
-    max_epochs: int = typer.Option(1, help="Maximum number of training epochs."),
-    min_epochs: int = typer.Option(1, help="Minimum number of training epochs."),
-    patience: int = typer.Option(5, help="Early stopping patience."),
-    learning_rate: float = typer.Option(3e-4, help="Learning rate."),
-    batch_size: int = typer.Option(32, help="Batch size."),
-    accumulate_grad_batches: int = typer.Option(1, help="Gradient accumulation steps."),
-    loader_workers: int = typer.Option(
-        0, help="DataLoader workers (0 is safest for MPS)."
-    ),
-    accelerator: AcceleratorType = typer.Option(
-        AcceleratorType.auto, help="Device: auto, cpu, mps, or gpu (cuda)."
-    ),
-    # GPT-2 architecture
-    n_embd: int = typer.Option(256, help="GPT-2 embedding dimension."),
-    n_head: int = typer.Option(4, help="GPT-2 attention heads."),
-    n_layer: int = typer.Option(6, help="GPT-2 transformer layers."),
-    seq_len: int = typer.Option(256, help="Maximum sequence length."),
-    # TRM architecture
-    trm_l_cycles: int = typer.Option(
-        4, help="Inner recursion steps per full TRM cycle."
-    ),
-    trm_h_cycles: int = typer.Option(2, help="Outer supervision cycles."),
-    trm_n_reasoning_layers: int = typer.Option(
-        2, help="Layers in TRM reasoning module."
-    ),
-    trm_insert_layer: Optional[int] = typer.Option(
-        None, help="Option B: GPT-2 layer to insert TRM at (default: n_layer//2)."
-    ),
-    # Data
-    train_csv: str = typer.Option("data/train_data.csv", help="Training CSV path."),
-    dev_csv: str = typer.Option("data/valid_data.csv", help="Validation CSV path."),
-    test_csv: str = typer.Option("data/valid_data.csv", help="Test CSV path."),
-):
-    """Train a GPT-2 model, optionally augmented with a TRM reasoning block."""
-    pl.seed_everything(seed)
-
-    gpt2_config = CustomGPT2Config(
-        n_embd=n_embd,
-        n_head=n_head,
-        n_layer=n_layer,
-        seq_len=seq_len,
+    # Checkpoints
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        filename="{epoch}-{val_loss:.2f}",
     )
-    trm_config = TRMBlockConfig(
+    lr_monitor = LearningRateMonitor(logging_interval="step")
+
+    # Trainer
+    # Map AcceleratorType to Lightning string
+    acc_val = accelerator.value
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator=acc_val,
+        devices=1,
+        logger=logger,
+        callbacks=[checkpoint_callback, lr_monitor],
+        precision="16-mixed" if torch.cuda.is_available() else "32",
+    )
+
+    # Train
+    trainer.fit(model)
+
+
+@app.command()
+def inference(
+    checkpoint_path: str = typer.Argument(
+        ..., help="Path to the .ckpt model checkpoint"
+    ),
+    prompt: str = typer.Argument(..., help="Prompt string to start generation"),
+    experiment: ExperimentType = typer.Option(
+        ExperimentType.baseline, help="Model variant used"
+    ),
+    modern: bool = typer.Option(
+        False, help="Whether the model uses modern architecture"
+    ),
+    max_new_tokens: int = typer.Option(50, help="Maximum number of tokens to generate"),
+    temperature: float = typer.Option(1.0, help="Sampling temperature"),
+    top_k: int = typer.Option(50, help="Top-k sampling threshold"),
+    n_layer: int = 6,
+    n_head: int = 4,
+    n_embd: int = 128,
+    h_cycles: int = 2,
+    l_cycles: int = 2,
+    n_reasoning_layers: int = 2,
+    trm_insert_layer: Optional[int] = typer.Option(
+        None, help="For Option B, which layer to insert the TRM block after"
+    ),
+):
+    """
+    Load a model from a checkpoint and generate text from a prompt.
+    """
+    gpt2_cfg = CustomGPT2Config(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        modern=modern,
+        n_kv_head=n_head // 2 if modern else None,
+    )
+    trm_cfg = TRMBlockConfig(
         hidden_size=n_embd,
         n_head=n_head,
-        L_cycles=trm_l_cycles,
-        H_cycles=trm_h_cycles,
-        n_reasoning_layers=trm_n_reasoning_layers,
-    )
-    common_kwargs = dict(
-        gpt2_config=gpt2_config,
-        trm_config=trm_config,
-        learning_rate=learning_rate,
-        train_csv=train_csv,
-        dev_csv=dev_csv,
-        test_csv=test_csv,
-        batch_size=batch_size,
-        loader_workers=loader_workers,
+        H_cycles=h_cycles,
+        L_cycles=l_cycles,
+        n_reasoning_layers=n_reasoning_layers,
+        modern=modern,
     )
 
-    model = _build_model(
-        experiment, gpt2_config, trm_config, common_kwargs, trm_insert_layer
-    )
+    common_kwargs = dict(gpt2_config=gpt2_cfg, trm_config=trm_cfg)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    typer.echo(f"\n{'=' * 60}")
-    typer.echo(f"Experiment: {experiment.value}")
-    typer.echo(f"Total parameters: {total_params:,}")
-    typer.echo(f"Trainable parameters: {trainable_params:,}")
-    typer.echo(
-        f"GPT-2: n_layer={n_layer}, n_embd={n_embd}, n_head={n_head}, seq_len={seq_len}"
-    )
-    typer.echo(
-        f"TRM: L_cycles={trm_l_cycles}, H_cycles={trm_h_cycles}, "
-        f"n_reasoning_layers={trm_n_reasoning_layers}"
-    )
-    typer.echo(
-        f"Training: batch_size={batch_size}, max_epochs={max_epochs}, lr={learning_rate}"
-    )
-    typer.echo(f"{'=' * 60}\n")
-
-    logger = TensorBoardLogger("experiments/", name=experiment.value)
-    callbacks = [
-        EarlyStopping(monitor="val_loss", patience=patience, verbose=True, mode="min"),
-        ModelCheckpoint(
-            dirpath=os.path.join(logger.log_dir, "checkpoints"),
-            filename="{epoch}-{val_loss:.4f}-{perplexity:.2f}",
-            save_top_k=2,
-            verbose=True,
-            monitor="val_loss",
-            mode="min",
-        ),
-        LearningRateMonitor(logging_interval="step"),
-    ]
-
-    if accelerator == AcceleratorType.auto:
-        if torch.backends.mps.is_available():
-            accel, devices = "mps", 1
-        elif torch.cuda.is_available():
-            accel, devices = "gpu", 1
-        else:
-            accel, devices = "cpu", "auto"
+    # Load from checkpoint
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    if experiment == ExperimentType.baseline:
+        model = GPT2Baseline.load_from_checkpoint(checkpoint_path, **common_kwargs)
+    elif experiment == ExperimentType.option_a:
+        model = GPT2TRMOptionA.load_from_checkpoint(checkpoint_path, **common_kwargs)
+    elif experiment == ExperimentType.option_b:
+        model = GPT2TRMOptionB.load_from_checkpoint(
+            checkpoint_path, trm_insert_layer=trm_insert_layer, **common_kwargs
+        )
     else:
-        accel = accelerator.value
-        devices = 1 if accel in ("mps", "gpu") else "auto"
+        raise ValueError(f"Unknown experiment: {experiment}")
 
-    trainer = pl.Trainer(
-        accelerator=accel,
-        devices=devices,
-        logger=logger,
-        callbacks=callbacks,
-        max_epochs=max_epochs,
-        min_epochs=min_epochs,
-        accumulate_grad_batches=accumulate_grad_batches,
-        gradient_clip_val=1.0,
-        log_every_n_steps=10,
-        precision="32-true",
+    model.eval()
+
+    # Encode prompt
+    tokens_tensor, _ = model.tokenizer.batch_encode([prompt])
+
+    # Generate
+    print("Generating...")
+    output_tokens = model.generate(
+        prompt_tokens=tokens_tensor,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
     )
-    trainer.fit(model)
+
+    # Decode and print
+    # Ignore padding index
+    output_list = [
+        t for t in output_tokens[0].tolist() if t != model.tokenizer.padding_index
+    ]
+    output_text = model.tokenizer.decode(output_list)
+    print("\n" + "=" * 40)
+    print("GENERATED TEXT")
+    print("=" * 40)
+    print(output_text)
+    print("=" * 40 + "\n")
 
 
 if __name__ == "__main__":
