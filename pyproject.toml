@@ -12,7 +12,11 @@ dependencies = [
     "numpy",
     "tensorboard",
     "pytest",
+    "typer>=0.24.1",
 ]
+
+[project.scripts]
+gpttrm-cli = "gpttrm.gpt.train_experiments:app"
 
 [tool.uv]
 package = true
