@@ -170,7 +170,7 @@ class TRMBlock(nn.Module):
 
         self.z_L_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
         self.z_H_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
-        self.gate = nn.Parameter(torch.tensor(-5.0))
+        self.gate = nn.Parameter(torch.tensor(-2.0))
 
         self.proj_in = nn.Identity()
         self.proj_out = nn.Identity()
