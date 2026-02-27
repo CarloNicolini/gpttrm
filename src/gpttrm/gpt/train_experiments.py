@@ -14,6 +14,7 @@ from gpttrm.gpt.models import (
     GPT2TRMOptionB,
     GPT2TRMOptionC,
     GPT2TRMBase,
+    GPT2SharedRecurrent,
 )
 
 app = typer.Typer()
@@ -24,6 +25,10 @@ class ExperimentType(str, Enum):
     option_a = "option_a"
     option_b = "option_b"
     option_c = "option_c"
+    # Shared-weight recurrence experiments (TRM-inspired)
+    shared_more_depth = "shared_more_depth"   # fewer params, more depth (2+K4+2=8 eff)
+    shared_equal_depth = "shared_equal_depth"  # fewer params, same depth (2+K2+2=6 eff)
+    shared_deep = "shared_deep"               # same params, much more depth (2+K8+2=12 eff)
 
 
 class AcceleratorType(str, Enum):
@@ -80,14 +85,29 @@ def train(
     scheduler: str = typer.Option("wsd", help="Learning rate scheduler: cosine or wsd"),
     warmup_steps: int = 500,
 ):
+    # --- Shared-recurrence presets override n_layer with their own layout ---
+    SHARED_PRESETS = {
+        ExperimentType.shared_more_depth:  {"bottom_n": 2, "recurrence_k": 4, "top_n": 2},
+        ExperimentType.shared_equal_depth: {"bottom_n": 2, "recurrence_k": 2, "top_n": 2},
+        ExperimentType.shared_deep:        {"bottom_n": 2, "recurrence_k": 8, "top_n": 2},
+    }
+
+    shared_preset = SHARED_PRESETS.get(experiment)
+
     # Setup configs
     gpt2_cfg = CustomGPT2Config(
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
         modern=modern,
-        n_kv_head=n_head // 2 if modern else None,  # Example GQA ratio
+        n_kv_head=n_head // 2 if modern else None,
     )
+
+    if shared_preset:
+        gpt2_cfg.recurrence_k = shared_preset["recurrence_k"]
+        gpt2_cfg.bottom_n = shared_preset["bottom_n"]
+        gpt2_cfg.top_n = shared_preset["top_n"]
+
     trm_cfg = TRMBlockConfig(
         hidden_size=n_embd,
         n_head=n_head,
@@ -115,8 +135,27 @@ def train(
         model = GPT2TRMOptionB(trm_insert_layer=trm_insert_layer, **common_kwargs)
     elif experiment == ExperimentType.option_c:
         model = GPT2TRMOptionC(trm_insert_layer=trm_insert_layer, **common_kwargs)
+    elif shared_preset:
+        model = GPT2SharedRecurrent(**common_kwargs)
     else:
         raise ValueError(f"Unknown experiment: {experiment}")
+
+    # Log model architecture summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if shared_preset:
+        K = shared_preset["recurrence_k"]
+        bn = shared_preset["bottom_n"]
+        tn = shared_preset["top_n"]
+        print(f"\n{'='*60}")
+        print(f"Shared Recurrent GPT-2: {bn} bottom + 1 shared x{K} + {tn} top")
+        print(f"Effective depth: {bn + K + tn} layers")
+        print(f"Unique blocks:   {bn + 1 + tn}")
+        print(f"Total params:    {total_params:,}")
+        print(f"Trainable:       {trainable_params:,}")
+        print(f"{'='*60}\n")
+    else:
+        print(f"\nModel: {experiment.value} | Params: {total_params:,}\n")
 
     # Logger
     exp_suffix = "modern" if modern else "standard"
@@ -168,7 +207,8 @@ def train(
                 self.original_state_dict = None
 
     callbacks = [checkpoint_callback, lr_monitor]
-    if experiment != ExperimentType.baseline:
+    use_ema = experiment not in (ExperimentType.baseline,)
+    if use_ema:
         callbacks.append(EMACallback(decay=0.999))
 
     # Trainer
@@ -269,6 +309,18 @@ def inference(
             break
     gpt2_cfg.seq_len = seq_len
 
+    # --- Shared-recurrence presets for inference ---
+    SHARED_PRESETS = {
+        ExperimentType.shared_more_depth:  {"bottom_n": 2, "recurrence_k": 4, "top_n": 2},
+        ExperimentType.shared_equal_depth: {"bottom_n": 2, "recurrence_k": 2, "top_n": 2},
+        ExperimentType.shared_deep:        {"bottom_n": 2, "recurrence_k": 8, "top_n": 2},
+    }
+    shared_preset = SHARED_PRESETS.get(experiment)
+    if shared_preset:
+        gpt2_cfg.recurrence_k = shared_preset["recurrence_k"]
+        gpt2_cfg.bottom_n = shared_preset["bottom_n"]
+        gpt2_cfg.top_n = shared_preset["top_n"]
+
     # --- Instantiate Model ---
     if experiment == ExperimentType.baseline:
         model = GPT2Baseline(**common_kwargs)
@@ -282,6 +334,8 @@ def inference(
         model = GPT2TRMOptionC.load_from_checkpoint(
             checkpoint_path, trm_insert_layer=trm_insert_layer, **common_kwargs
         )
+    elif shared_preset:
+        model = GPT2SharedRecurrent(**common_kwargs)
     else:
         raise ValueError(f"Unknown experiment: {experiment}")
 

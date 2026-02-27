@@ -16,7 +16,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 
-from gpttrm.gpt.custom_gpt2 import CustomGPT2Config, CustomGPT2Model, RMSNorm
+from gpttrm.gpt.custom_gpt2 import (
+    CustomGPT2Config,
+    CustomGPT2Model,
+    SharedRecurrentGPT2Model,
+    RMSNorm,
+)
 from gpttrm.gpt.trm_block import TRMBlockConfig, TRMBlock
 from gpttrm.gpt.gpt2_tokenizer import GPT2TextEncoder
 from gpttrm.gpt.dataloader import text_dataset
@@ -708,3 +713,35 @@ class GPT2TRMOptionC(GPT2TRMBase):
             logits = self.lm_head(hidden_states)
 
         return logits, trm_metrics
+
+
+# ---------------------------------------------------------------------------
+# Shared-Weight Recurrence (TRM-inspired, no TRM machinery)
+# ---------------------------------------------------------------------------
+
+
+class GPT2SharedRecurrent(GPT2TRMBase):
+    """
+    Shared-weight recurrent GPT-2: the one transferable idea from TRM.
+
+    Architecture:
+        Tokens -> bottom_n unique layers -> 1 shared block x K -> top_n unique layers -> LM Head
+
+    Effective depth = bottom_n + K + top_n, parameters ~ bottom_n + 1 + top_n blocks.
+    Full gradient flow throughout -- no detach, no dual residual, no deep supervision.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.gpt2 = SharedRecurrentGPT2Model(self.gpt2_config)
+        self.lm_head = nn.Linear(
+            self.gpt2_config.n_embd, self.gpt2_config.vocab_size, bias=False
+        )
+        if self.gpt2_config.tie_word_embeddings:
+            self.lm_head.weight = self.gpt2.wte.weight
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.gpt2(idx=tokens)
+        logits = self.lm_head(hidden_states)
+        return logits

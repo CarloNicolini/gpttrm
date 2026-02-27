@@ -23,6 +23,13 @@ class CustomGPT2Config:
     n_kv_head: Optional[int] = None  # For GQA (Grouped Query Attention)
     rope_theta: float = 10000.0  # Base frequency for RoPE
 
+    # -- Shared-Weight Recurrence (TRM-inspired) --
+    # When recurrence_k > 0, n_layer is ignored and the model uses:
+    #   bottom_n unique layers + 1 shared block x K + top_n unique layers
+    recurrence_k: int = 0
+    bottom_n: int = 2
+    top_n: int = 2
+
 
 # ---------------------------------------------------------------------------
 # Modern Components: RMSNorm, RoPE, SwiGLU
@@ -294,4 +301,85 @@ class CustomGPT2Model(nn.Module):
         if end_layer == self.config.n_layer:
             x = self.transformer.ln_f(x)
 
+        return x
+
+
+class SharedRecurrentGPT2Model(nn.Module):
+    """GPT-2 with a shared-weight recurrent block in the middle.
+
+    Architecture:
+        bottom_n unique blocks -> 1 shared block x K -> top_n unique blocks
+
+    The shared block is a standard GPT-2 block reused K times with full
+    gradient flow. This emulates depth (bottom_n + K + top_n effective layers)
+    while using only (bottom_n + 1 + top_n) sets of parameters.
+    """
+
+    def __init__(self, config: CustomGPT2Config):
+        super().__init__()
+        self.config = config
+        K = config.recurrence_k
+        bottom_n = config.bottom_n
+        top_n = config.top_n
+        assert K > 0, "recurrence_k must be > 0 for SharedRecurrentGPT2Model"
+
+        effective_depth = bottom_n + K + top_n
+
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+
+        if not config.modern:
+            self.wpe = nn.Embedding(config.seq_len, config.n_embd)
+
+        self.bottom = nn.ModuleList(
+            [CustomGPT2Block(config) for _ in range(bottom_n)]
+        )
+        self.shared = CustomGPT2Block(config)
+        self.K = K
+        self.top = nn.ModuleList(
+            [CustomGPT2Block(config) for _ in range(top_n)]
+        )
+
+        self.ln_f = (
+            RMSNorm(config.n_embd) if config.modern
+            else nn.LayerNorm(config.n_embd)
+        )
+
+        self.apply(self._init_weights)
+
+        # Scaled init for residual projections, using effective depth
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight") or pn.endswith("down_proj.weight"):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * effective_depth)
+                )
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        b, t = idx.size()
+        x = self.wte(idx)
+
+        if not self.config.modern:
+            pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
+            x = x + self.wpe(pos)
+
+        x = self.drop(x)
+
+        for block in self.bottom:
+            x = block(x)
+
+        for _ in range(self.K):
+            x = self.shared(x)
+
+        for block in self.top:
+            x = block(x)
+
+        x = self.ln_f(x)
         return x
